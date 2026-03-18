@@ -7,7 +7,6 @@ import traceback
 
 app = FastAPI()
 
-# 1. Odblokowanie połączeń (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,19 +15,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Model danych odbieranych z aplikacji Android
 class RouteRequest(BaseModel):
     num_vehicles: int = 1
     starts: list[int]
     ends: list[int]
-    first_nodes: list[int] = [] 
+    first_nodes: list[int] = []
     last_nodes: list[int] = []
     time_matrix: list[list[int]]
     time_windows: list[tuple[int, int]]
 
 @app.post("/solve_tsptw")
 def solve_tsptw(request: RouteRequest):
-    # 3. Zabezpieczenie przed wyłączeniem serwera (Try-Except)
     try:
         data = {
             'time_matrix': request.time_matrix,
@@ -40,16 +37,20 @@ def solve_tsptw(request: RouteRequest):
             'last_nodes': request.last_nodes
         }
 
-        # 4. Inicjalizacja menedżera tras
+        # =========================
+        # MODEL
+        # =========================
         manager = pywrapcp.RoutingIndexManager(
-            len(data['time_matrix']), 
-            data['num_vehicles'], 
-            data['starts'], 
+            len(data['time_matrix']),
+            data['num_vehicles'],
+            data['starts'],
             data['ends']
         )
         routing = pywrapcp.RoutingModel(manager)
 
-        # 5. Konfiguracja odległości/czasu
+        # =========================
+        # COST (czas przejazdu)
+        # =========================
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
@@ -58,94 +59,150 @@ def solve_tsptw(request: RouteRequest):
         transit_callback_index = routing.RegisterTransitCallback(time_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-        # 6. Okienka Czasowe (Time Windows)
-        time = 'Time'
+        # =========================
+        # TIME DIMENSION (KLUCZOWE)
+        # =========================
         routing.AddDimension(
             transit_callback_index,
-            3600,   # Max czas oczekiwania (np. pod adresem na otwarcie okienka)
-            86400,  # Max łączny czas trasy (24 godziny)
-            False, 
-            time)
-        time_dimension = routing.GetDimensionOrDie(time)
+            0,          # brak czekania (ważne!)
+            86400,      # max czas trasy
+            True,       # start = 0
+            "Time"
+        )
+        time_dimension = routing.GetDimensionOrDie("Time")
 
+        # Minimalizuj całkowity czas trasy
+        time_dimension.SetGlobalSpanCostCoefficient(100)
+
+        # Ustaw start czasu = 0
+        for i in range(data['num_vehicles']):
+            start_idx = routing.Start(i)
+            time_dimension.CumulVar(start_idx).SetRange(0, 0)
+
+        # =========================
+        # TIME WINDOWS
+        # =========================
         for location_idx, time_window in enumerate(data['time_windows']):
             if location_idx in data['starts'] or location_idx in data['ends']:
                 continue
             index = manager.NodeToIndex(location_idx)
             time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
 
-        # 7. Bezpieczne wymuszanie adresów First i Last (Licznik kroków)
+        # =========================
+        # STEP ORDER (first / last)
+        # =========================
         routing.AddConstantDimension(
-            1, 
-            len(data['time_matrix']) + 1, 
-            True, 
-            'StepCounter'
+            1,
+            len(data['time_matrix']) + 1,
+            True,
+            "StepCounter"
         )
-        step_dimension = routing.GetDimensionOrDie('StepCounter')
+        step_dimension = routing.GetDimensionOrDie("StepCounter")
 
         num_first = len(data['first_nodes'])
         num_last = len(data['last_nodes'])
-        
-        middle_nodes = [i for i in range(len(data['time_matrix'])) if i not in data['starts'] and i not in data['ends'] and i not in data['first_nodes'] and i not in data['last_nodes']]
+
+        middle_nodes = [
+            i for i in range(len(data['time_matrix']))
+            if i not in data['starts']
+            and i not in data['ends']
+            and i not in data['first_nodes']
+            and i not in data['last_nodes']
+        ]
         num_mid = len(middle_nodes)
 
         for node in range(len(data['time_matrix'])):
             if node in data['starts'] or node in data['ends']:
                 continue
-                
+
             index = manager.NodeToIndex(node)
-            
+
             if node in data['first_nodes']:
                 step_dimension.CumulVar(index).SetRange(1, num_first)
             elif node in data['last_nodes']:
-                step_dimension.CumulVar(index).SetRange(num_first + num_mid + 1, num_first + num_mid + num_last)
+                step_dimension.CumulVar(index).SetRange(
+                    num_first + num_mid + 1,
+                    num_first + num_mid + num_last
+                )
             else:
-                step_dimension.CumulVar(index).SetRange(num_first + 1, num_first + num_mid)
+                step_dimension.CumulVar(index).SetRange(
+                    num_first + 1,
+                    num_first + num_mid
+                )
 
-        # 8. PARAMETRY WYSZUKIWANIA (Zmienione, aby wyeliminować "Spaghetti")
+        # =========================
+        # KARY ZA POMINIĘCIE
+        # =========================
+        penalty = 100000
+        for node in range(len(data['time_matrix'])):
+            if node not in data['starts'] and node not in data['ends']:
+                routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+
+        # =========================
+        # SEARCH PARAMS
+        # =========================
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-        
-        # SAVINGS - Algorytm budujący okrągłe klastry (zapobiega skakaniu po mapie)
-        search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
-        # GUIDED_LOCAL_SEARCH - Doszlifowuje szczegóły
-        search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        # Dajemy algorytmowi 30 sekund na precyzyjne odplątanie węzłów
+
+        search_parameters.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        )
+
+        search_parameters.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        )
+
         search_parameters.time_limit.seconds = 30
 
-        # 9. Uruchomienie obliczeń
+        # =========================
+        # SOLVE
+        # =========================
         solution = routing.SolveWithParameters(search_parameters)
 
-        # 10. Generowanie odpowiedzi (JSON)
+        # =========================
+        # OUTPUT
+        # =========================
         if solution:
-            index = routing.Start(0)
-            route = []
-            
-            while not routing.IsEnd(index):
+            routes = []
+
+            for vehicle_id in range(data['num_vehicles']):
+                index = routing.Start(vehicle_id)
+                route = []
+
+                while not routing.IsEnd(index):
+                    node = manager.IndexToNode(index)
+                    time_var = time_dimension.CumulVar(index)
+
+                    route.append({
+                        "node": node,
+                        "arrival_min": solution.Min(time_var),
+                        "arrival_max": solution.Max(time_var)
+                    })
+
+                    index = solution.Value(routing.NextVar(index))
+
+                node = manager.IndexToNode(index)
                 time_var = time_dimension.CumulVar(index)
+
                 route.append({
-                    "node": manager.IndexToNode(index),
+                    "node": node,
                     "arrival_min": solution.Min(time_var),
                     "arrival_max": solution.Max(time_var)
                 })
-                index = solution.Value(routing.NextVar(index))
-                
-            # Dodanie punktu końcowego
-            time_var = time_dimension.CumulVar(index)
-            route.append({
-                "node": manager.IndexToNode(index),
-                "arrival_min": solution.Min(time_var),
-                "arrival_max": solution.Max(time_var)
-            })
-            
-            return {"status": "success", "route": route}
+
+                routes.append(route)
+
+            return {"status": "success", "routes": routes}
+
         else:
-            return {"status": "failed", "message": "Nie znaleziono trasy w wyznaczonym czasie. Sprawdź okienka czasowe."}
-            
+            return {
+                "status": "failed",
+                "message": "Nie znaleziono trasy. Sprawdź dane."
+            }
+
     except Exception as e:
-        # 11. Zwrot dokładnego błędu w przypadku crasha
         return {
-            "status": "error", 
-            "message": "Błąd wewnętrzny serwera Pythona.", 
+            "status": "error",
+            "message": "Błąd Pythona",
             "details": str(e),
             "traceback": traceback.format_exc()
         }
