@@ -2,17 +2,24 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class RouteRequest(BaseModel):
     num_vehicles: int = 1
     starts: list[int]
     ends: list[int]
-    # NOWE POLA: Listy adresów na początek i na koniec (domyślnie puste)
     first_nodes: list[int] = [] 
     last_nodes: list[int] = []
-    
     time_matrix: list[list[int]]
     time_windows: list[tuple[int, int]]
 
@@ -28,7 +35,6 @@ def solve_tsptw(request: RouteRequest):
         'last_nodes': request.last_nodes
     }
 
-    # 1. Inicjalizacja
     manager = pywrapcp.RoutingIndexManager(
         len(data['time_matrix']), 
         data['num_vehicles'], 
@@ -37,7 +43,7 @@ def solve_tsptw(request: RouteRequest):
     )
     routing = pywrapcp.RoutingModel(manager)
 
-    # 2. Definicja czasu przejazdu
+    # Definicja czasu przejazdu
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
@@ -46,12 +52,12 @@ def solve_tsptw(request: RouteRequest):
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # 3. DODANIE OKIENEK CZASOWYCH
+    # Dodanie Wymiaru Czasu (Okienka czasowe)
     time = 'Time'
     routing.AddDimension(
         transit_callback_index,
-        3600,  # Max czas oczekiwania
-        86400, # Max czas całej trasy
+        3600,  
+        86400, 
         False, 
         time)
     time_dimension = routing.GetDimensionOrDie(time)
@@ -63,45 +69,53 @@ def solve_tsptw(request: RouteRequest):
         time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
 
     # ---------------------------------------------------------------------
-    # 4. NOWOŚĆ: WYMUSZANIE ADRESÓW NA POCZĄTKU I NA KOŃCU (Tiers System)
+    # BEZPIECZNY SYSTEM WYMUSZANIA KOLEJNOŚCI (Licznik Kroków)
     # ---------------------------------------------------------------------
-    def get_node_tier(node):
-        if node in data['starts']: return 0
-        if node in data['first_nodes']: return 1
-        if node in data['last_nodes']: return 3
-        if node in data['ends']: return 4
-        return 2 # Zwykłe adresy (środek)
+    # Wymiar, który rośnie zawsze o 1 z każdym odwiedzonym adresem
+    routing.AddConstantDimension(
+        1, 
+        len(data['time_matrix']) + 1, 
+        True, 
+        'StepCounter', 
+        False
+    )
+    step_dimension = routing.GetDimensionOrDie('StepCounter')
 
-    # Fizyczne usuwanie dróg pozwalających na "cofanie się"
-    num_nodes = len(data['time_matrix'])
-    for from_node in range(num_nodes):
-        for to_node in range(num_nodes):
-            if from_node == to_node:
-                continue
-                
-            from_tier = get_node_tier(from_node)
-            to_tier = get_node_tier(to_node)
+    # Obliczamy ile mamy poszczególnych węzłów
+    num_first = len(data['first_nodes'])
+    num_last = len(data['last_nodes'])
+    
+    # Wszystkie węzły "zwykłe" (środkowe)
+    middle_nodes = [i for i in range(len(data['time_matrix'])) if i not in data['starts'] and i not in data['ends'] and i not in data['first_nodes'] and i not in data['last_nodes']]
+    num_mid = len(middle_nodes)
+
+    # Ograniczamy matematycznie, na którym "kroku" można odwiedzić dany adres
+    for node in range(len(data['time_matrix'])):
+        if node in data['starts'] or node in data['ends']:
+            continue
             
-            # Jeśli próbujemy jechać z wyższego poziomu do niższego (np. z poziomu 2 do 1)
-            # zabraniamy tego ruchu (algorytm nigdy nie sprawdzi tej drogi).
-            if from_tier > to_tier:
-                from_index = manager.NodeToIndex(from_node)
-                to_index = manager.NodeToIndex(to_node)
-                # Upewniamy się, że nie modyfikujemy punktu końcowego (nie ma następcy)
-                if not routing.IsEnd(from_index):
-                    routing.NextVar(from_index).RemoveValue(to_index)
+        index = manager.NodeToIndex(node)
+        
+        if node in data['first_nodes']:
+            # Odwiedź w pierwszych dostępnych krokach (od 1 do liczby pierwszych węzłów)
+            step_dimension.CumulVar(index).SetRange(1, num_first)
+            
+        elif node in data['last_nodes']:
+            # Odwiedź na samym końcu
+            step_dimension.CumulVar(index).SetRange(num_first + num_mid + 1, num_first + num_mid + num_last)
+            
+        else:
+            # Węzły środkowe lądują pośrodku
+            step_dimension.CumulVar(index).SetRange(num_first + 1, num_first + num_mid)
     # ---------------------------------------------------------------------
 
-    # 5. Parametry wyszukiwania
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_parameters.time_limit.seconds = 25
 
-    # 6. Rozwiązywanie
     solution = routing.SolveWithParameters(search_parameters)
 
-    # 7. Zwracanie wyników
     if solution:
         index = routing.Start(0)
         route = []
@@ -124,4 +138,4 @@ def solve_tsptw(request: RouteRequest):
         
         return {"status": "success", "route": route}
     else:
-        return {"status": "failed", "message": "Nie znaleziono trasy w 25 sekund. Sprawdź, czy okienka czasowe nie wykluczają się nawzajem!"}
+        return {"status": "failed", "message": "Nie znaleziono trasy. Sprawdź okienka czasowe."}
