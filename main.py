@@ -1,4 +1,3 @@
-```python
 from fastapi import FastAPI
 from pydantic import BaseModel
 from ortools.constraint_solver import routing_enums_pb2
@@ -207,4 +206,3 @@ def solve_tsptw(request: RouteRequest):
             "details": str(e),
             "traceback": traceback.format_exc()
         }
-```
