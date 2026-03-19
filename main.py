@@ -69,7 +69,7 @@ def solve_tsptw(request: RouteRequest):
         time = 'Time'
         routing.AddDimension(
             time_callback_index, # Używa macierzy czasu
-            3600,   
+            1800,   
             86400,  
             False, 
             time)
