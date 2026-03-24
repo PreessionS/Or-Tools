@@ -51,18 +51,20 @@ def solve_tsptw(request: RouteRequest):
         routing = pywrapcp.RoutingModel(manager)
 
         # ══════════════════════════════════════════════
-        # CALLBACK ODLEGŁOŚCI (minimalizacja kilometrów)
+        # CALLBACK – COMBINED COST (czas + dystans)
         # ══════════════════════════════════════════════
-        def distance_callback(from_index, to_index):
+        def combined_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            return data['distance_matrix'][from_node][to_node]
+            distance = data['distance_matrix'][from_node][to_node]
+            time = data['time_matrix'][from_node][to_node]
+            return int(distance + time * 2)  # waga czasu większa niż dystansu
 
-        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        combined_callback_index = routing.RegisterTransitCallback(combined_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(combined_callback_index)
 
         # ══════════════════════════════════════════════
-        # CALLBACK CZASU (weryfikacja okienek czasowych)
+        # DIMENSION – CZAS (Time Windows)
         # ══════════════════════════════════════════════
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -70,7 +72,6 @@ def solve_tsptw(request: RouteRequest):
             return data['time_matrix'][from_node][to_node]
 
         time_callback_index = routing.RegisterTransitCallback(time_callback)
-
         routing.AddDimension(
             time_callback_index,
             1800,   # Max oczekiwanie: 30 minut
@@ -80,9 +81,7 @@ def solve_tsptw(request: RouteRequest):
         )
         time_dimension = routing.GetDimensionOrDie('Time')
 
-        # ══════════════════════════════════════════════
-        # OKIENKA CZASOWE
-        # ══════════════════════════════════════════════
+        # ustawienie okienek czasowych
         for location_idx, time_window in enumerate(data['time_windows']):
             if location_idx in data['starts'] or location_idx in data['ends']:
                 continue
@@ -90,7 +89,7 @@ def solve_tsptw(request: RouteRequest):
             time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
 
         # ══════════════════════════════════════════════
-        # STEP COUNTER (tylko gdy first/last są podane)
+        # STEP COUNTER – opcjonalnie dla first/last nodes
         # ══════════════════════════════════════════════
         if data['first_nodes'] or data['last_nodes']:
             routing.AddConstantDimension(
@@ -130,19 +129,24 @@ def solve_tsptw(request: RouteRequest):
                     )
 
         # ══════════════════════════════════════════════
+        # GLOBAL SPAN – kara za długie trasy
+        # ══════════════════════════════════════════════
+        distance_dimension = routing.GetDimensionOrDie('StepCounter')  # używamy StepCounter
+        distance_dimension.SetGlobalSpanCostCoefficient(100)
+
+        # ══════════════════════════════════════════════
         # PARAMETRY SZUKANIA
         # ══════════════════════════════════════════════
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-
         search_parameters.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PATH_MOST_CONSTRAINED_ARC
+            routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
         )
-
         search_parameters.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         )
         search_parameters.guided_local_search_lambda_coefficient = 0.15
 
+        # dynamiczny limit czasu
         n = len(data['distance_matrix'])
         if n <= 10:
             time_limit = 2
@@ -153,7 +157,7 @@ def solve_tsptw(request: RouteRequest):
         elif n <= 80:
             time_limit = 25
         else:
-            time_limit = 45
+            time_limit = 50  # zwiększony limit
         search_parameters.time_limit.seconds = time_limit
 
         # ══════════════════════════════════════════════
