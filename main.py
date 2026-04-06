@@ -174,9 +174,9 @@ def solve_tsptw(request: RouteRequest):
         elif n <= 40:
             time_limit = 15
         elif n <= 80:
-            time_limit = 30
+            time_limit = 40
         else:
-            time_limit = 50
+            time_limit = 60
         search_parameters.time_limit.seconds = time_limit
 
         # ── Logi do debugowania (opcjonalnie) ──
