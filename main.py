@@ -170,9 +170,9 @@ def solve_tsptw(request: RouteRequest):
         if n <= 10:
             time_limit = 3
         elif n <= 20:
-            time_limit = 8
-        elif n <= 40:
-            time_limit = 15
+            time_limit = 10
+        elif n <= 42:
+            time_limit = 25
         elif n <= 80:
             time_limit = 40
         else:
