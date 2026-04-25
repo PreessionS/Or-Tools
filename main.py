@@ -39,8 +39,6 @@ def solve_tsptw(request: RouteRequest):
             'last_nodes': request.last_nodes
         }
 
-        MAX_WAIT_SECONDS = 900  # 15 minut - maksymalne dozwolone czekanie
-
         # ══════════════════════════════════════════════
         # WYKRYWANIE CZY SĄ AKTYWNE OGRANICZENIA
         # ══════════════════════════════════════════════
@@ -63,7 +61,7 @@ def solve_tsptw(request: RouteRequest):
         routing = pywrapcp.RoutingModel(manager)
 
         # ══════════════════════════════════════════════
-        # CALLBACK ODLEGŁOŚCI
+        # CALLBACK ODLEGŁOŚCI (minimalizacja kilometrów)
         # ══════════════════════════════════════════════
         def distance_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -74,7 +72,7 @@ def solve_tsptw(request: RouteRequest):
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
         # ══════════════════════════════════════════════
-        # CALLBACK CZASU
+        # CALLBACK CZASU (weryfikacja okienek czasowych)
         # ══════════════════════════════════════════════
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -83,65 +81,26 @@ def solve_tsptw(request: RouteRequest):
 
         time_callback_index = routing.RegisterTransitCallback(time_callback)
 
-        # ══════════════════════════════════════════════
-        # DIMENSION CZASU
-        # MAX_WAIT_SECONDS = 900 (15 minut)
-        # Solver może czekać MAKSYMALNIE 15 minut w węźle
-        # Jeśli okienko wymaga dłuższego czekania to solver
-        # szuka innej kolejności węzłów
-        # Jeśli nie ma innej opcji - trasa jest niemożliwa
-        # ══════════════════════════════════════════════
         routing.AddDimension(
             time_callback_index,
-            MAX_WAIT_SECONDS,  # max czekanie w węźle = 15 minut
-            86400,             # max całkowity czas = 24h
+            1800,
+            86400,
             False,
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
 
         # ══════════════════════════════════════════════
-        # KARA ZA CZEKANIE
-        # Solver aktywnie szuka kolejności węzłów
-        # która minimalizuje łączny czas (w tym czekanie)
-        # Współczynnik 10 = mocna kara za każdą minutę czekania
-        # ══════════════════════════════════════════════
-        for vehicle_id in range(data['num_vehicles']):
-            time_dimension.SetSpanCostCoefficientForVehicle(10, vehicle_id)
-
-        # ══════════════════════════════════════════════
-        # OKIENKA CZASOWE DLA WĘZŁÓW
+        # OKIENKA CZASOWE
         # ══════════════════════════════════════════════
         for location_idx, time_window in enumerate(data['time_windows']):
             if location_idx in data['starts'] or location_idx in data['ends']:
                 continue
             index = manager.NodeToIndex(location_idx)
-            time_dimension.CumulVar(index).SetRange(
-                time_window[0],
-                time_window[1]
-            )
+            time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
 
         # ══════════════════════════════════════════════
-        # OKIENKA CZASOWE DLA STARTU I KOŃCA KAŻDEGO POJAZDU
-        # ══════════════════════════════════════════════
-        for vehicle_id in range(data['num_vehicles']):
-            start_index = routing.Start(vehicle_id)
-            end_index = routing.End(vehicle_id)
-
-            start_node = data['starts'][vehicle_id]
-            end_node = data['ends'][vehicle_id]
-
-            time_dimension.CumulVar(start_index).SetRange(
-                data['time_windows'][start_node][0],
-                data['time_windows'][start_node][1]
-            )
-            time_dimension.CumulVar(end_index).SetRange(
-                data['time_windows'][end_node][0],
-                data['time_windows'][end_node][1]
-            )
-
-        # ══════════════════════════════════════════════
-        # STEP COUNTER (kolejność first/last)
+        # STEP COUNTER (tylko gdy first/last są podane)
         # ══════════════════════════════════════════════
         if has_ordering:
             routing.AddConstantDimension(
@@ -181,24 +140,32 @@ def solve_tsptw(request: RouteRequest):
                     )
 
         # ══════════════════════════════════════════════
-        # PARAMETRY SZUKANIA
+        # PARAMETRY SZUKANIA — KLUCZOWA ZMIANA
         # ══════════════════════════════════════════════
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
 
+        # ── Strategia startowa zależna od ograniczeń ──
         if has_real_time_windows or has_ordering:
+            # Dużo ograniczeń → strategia uwzględniająca constrainty
             search_parameters.first_solution_strategy = (
                 routing_enums_pb2.FirstSolutionStrategy.PATH_MOST_CONSTRAINED_ARC
             )
         else:
+            # Brak ograniczeń → buduj trasę "zachłannie" po najkrótszych łukach
+            # To naturalnie tworzy klastry geograficzne (miasta)
             search_parameters.first_solution_strategy = (
                 routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             )
 
+        # ── Metaheurystyka: GLS z agresywniejszym współczynnikiem ──
         search_parameters.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         )
+        # 0.15 to za mało — solver zbyt wolno ucieka z lokalnych minimów
+        # 0.5 penalizuje mocniej powtórne użycie długich łuków (przeskoków)
         search_parameters.guided_local_search_lambda_coefficient = 0.5
 
+        # ── Czas zależny od wielkości problemu ──
         n = len(data['distance_matrix'])
         if n <= 10:
             time_limit = 3
@@ -211,6 +178,8 @@ def solve_tsptw(request: RouteRequest):
         else:
             time_limit = 50
         search_parameters.time_limit.seconds = time_limit
+
+        # ── Logi do debugowania (opcjonalnie) ──
         search_parameters.log_search = True
 
         # ══════════════════════════════════════════════
@@ -228,59 +197,32 @@ def solve_tsptw(request: RouteRequest):
             for vehicle_id in range(data['num_vehicles']):
                 index = routing.Start(vehicle_id)
                 route = []
-                prev_arrival = None
 
                 while not routing.IsEnd(index):
                     time_var = time_dimension.CumulVar(index)
                     node = manager.IndexToNode(index)
-                    arrival = solution.Min(time_var)
-                    window_start = data['time_windows'][node][0]
-                    window_end = data['time_windows'][node][1]
-
-                    # Ile sekund kierowca musi czekać na otwarcie okienka
-                    forced_wait = max(0, window_start - arrival)
-
                     route.append({
                         "node": node,
-                        "arrival": arrival,
-                        "window": {
-                            "from": window_start,
-                            "to": window_end
-                        },
-                        # Czekanie wymagane przez okienko (max 15 min bo
-                        # solver szukał kolejności żeby tego unikać)
-                        "forced_wait_seconds": forced_wait,
-                        "forced_wait_minutes": round(forced_wait / 60, 1),
-                        # Czy czekanie wystąpiło
-                        "has_wait": forced_wait > 0
+                        "arrival_min": solution.Min(time_var),
+                        "arrival_max": solution.Max(time_var)
                     })
-
                     next_index = solution.Value(routing.NextVar(index))
                     total_distance += routing.GetArcCostForVehicle(
                         index, next_index, vehicle_id
                     )
                     index = next_index
 
-                # Ostatni węzeł (koniec)
                 time_var = time_dimension.CumulVar(index)
-                node = manager.IndexToNode(index)
                 route.append({
-                    "node": node,
-                    "arrival": solution.Min(time_var),
-                    "window": {
-                        "from": data['time_windows'][node][0],
-                        "to": data['time_windows'][node][1]
-                    },
-                    "forced_wait_seconds": 0,
-                    "forced_wait_minutes": 0,
-                    "has_wait": False
+                    "node": manager.IndexToNode(index),
+                    "arrival_min": solution.Min(time_var),
+                    "arrival_max": solution.Max(time_var)
                 })
                 all_routes.append(route)
 
             result = {
                 "status": "success",
                 "total_distance": total_distance,
-                "max_wait_allowed_minutes": MAX_WAIT_SECONDS // 60,
                 "computing_time_used": time_limit,
                 "strategy_used": "constrained" if (
                     has_real_time_windows or has_ordering
@@ -296,14 +238,7 @@ def solve_tsptw(request: RouteRequest):
         else:
             return {
                 "status": "failed",
-                # Informacja dla użytkownika dlaczego nie znaleziono trasy
-                "message": (
-                    "Nie znaleziono trasy. "
-                    "Okienka czasowe są zbyt restrykcyjne - "
-                    "nie można ułożyć kolejności węzłów "
-                    f"z maksymalnym czekaniem {MAX_WAIT_SECONDS // 60} minut. "
-                    "Sprawdź czy okienka czasowe nie wykluczają się nawzajem."
-                )
+                "message": "Nie znaleziono trasy."
             }
 
     except Exception as e:
