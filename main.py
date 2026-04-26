@@ -17,6 +17,7 @@ app.add_middleware(
 
 class RouteRequest(BaseModel):
     num_vehicles: int = 1
+    start_seconds: int = 0
     starts: list[int]
     ends: list[int]
     first_nodes: list[int] = []
@@ -33,6 +34,7 @@ def solve_tsptw(request: RouteRequest):
             'time_matrix': request.time_matrix,
             'time_windows': request.time_windows,
             'num_vehicles': request.num_vehicles,
+            'start_seconds': request.start_seconds,
             'starts': request.starts,
             'ends': request.ends,
             'first_nodes': request.first_nodes,
@@ -83,12 +85,19 @@ def solve_tsptw(request: RouteRequest):
 
         routing.AddDimension(
             time_callback_index,
-            1800,
             86400,
+            172800,
             False,
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
+
+        for vehicle_id in range(data['num_vehicles']):
+            start_index = routing.Start(vehicle_id)
+            time_dimension.CumulVar(start_index).SetRange(
+                data['start_seconds'],
+                data['start_seconds']
+            )
 
         # ══════════════════════════════════════════════
         # OKIENKA CZASOWE
