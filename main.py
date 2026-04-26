@@ -91,7 +91,8 @@ def solve_tsptw(request: RouteRequest):
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
-
+        time_dimension.SetSlackCostCoefficientForAllVehicles(60)
+ 
         for vehicle_id in range(data['num_vehicles']):
             start_index = routing.Start(vehicle_id)
             time_dimension.CumulVar(start_index).SetRange(
