@@ -32,8 +32,11 @@ class RouteRequest(BaseModel):
     # [(start, end)]
     time_windows: list[tuple[int, int]]
 
-    # Kara za każdą sekundę czekania
-    wait_penalty_coefficient: int = 150
+    # Kara za wcześniejszy przyjazd
+    early_penalty: int = 1000
+
+    # Kara za spóźnienie
+    late_penalty: int = 2000
 
 
 @app.post("/solve_tsptw")
@@ -51,7 +54,8 @@ def solve_tsptw(request: RouteRequest):
             'ends': request.ends,
             'first_nodes': request.first_nodes,
             'last_nodes': request.last_nodes,
-            'wait_penalty_coefficient': request.wait_penalty_coefficient
+            'early_penalty': request.early_penalty,
+            'late_penalty': request.late_penalty
         }
 
         # ══════════════════════════════════════════════
@@ -117,39 +121,41 @@ def solve_tsptw(request: RouteRequest):
 
         # ══════════════════════════════════════════════
         # WYMIAR CZASU
-        # MAX 30 MIN WCZEŚNIEJ / PÓŹNIEJ
+        # BRAK CZEKANIA + SOFT TIME WINDOWS
         # ══════════════════════════════════════════════
+
+        routing.AddDimension(
+            time_callback_index,
+            0,          # BRAK slack/czekania
+            172800,
+            False,
+            'Time'
+        )
+
+        time_dimension = routing.GetDimensionOrDie('Time')
+
+        # ══════════════════════════════════════════════
+        # START POJAZDÓW
+        # ══════════════════════════════════════════════
+
+        for vehicle_id in range(data['num_vehicles']):
+
+            start_index = routing.Start(vehicle_id)
+
+            time_dimension.CumulVar(start_index).SetRange(
+                data['start_seconds'],
+                data['start_seconds']
+            )
+
+        # ══════════════════════════════════════════════
+        # OKNA CZASOWE
+        # ±30 MIN ODCHYLENIA
+        # ══════════════════════════════════════════════
+
+        MAX_DEVIATION = 1800  # 30 minut
 
         if has_real_time_windows:
 
-            MAX_EARLY_LATE = 1800  # 30 minut
-
-            routing.AddDimension(
-                time_callback_index,
-                MAX_EARLY_LATE,   # max slack/wait
-                172800,
-                False,
-                'Time'
-            )
-
-            time_dimension = routing.GetDimensionOrDie('Time')
-
-            # Kara za czekanie
-            time_dimension.SetSlackCostCoefficientForAllVehicles(
-                data['wait_penalty_coefficient']
-            )
-
-            # Ustawienie czasu startu
-            for vehicle_id in range(data['num_vehicles']):
-
-                start_index = routing.Start(vehicle_id)
-
-                time_dimension.CumulVar(start_index).SetRange(
-                    data['start_seconds'],
-                    data['start_seconds']
-                )
-
-            # Okna czasowe z tolerancją ±30 minut
             for location_idx, time_window in enumerate(
                 data['time_windows']
             ):
@@ -162,43 +168,33 @@ def solve_tsptw(request: RouteRequest):
 
                 index = manager.NodeToIndex(location_idx)
 
-                start_window = max(
+                # Twardy zakres ±30 minut
+                hard_start = max(
                     0,
-                    time_window[0] - MAX_EARLY_LATE
+                    time_window[0] - MAX_DEVIATION
                 )
 
-                end_window = (
-                    time_window[1] + MAX_EARLY_LATE
+                hard_end = (
+                    time_window[1] + MAX_DEVIATION
                 )
 
                 time_dimension.CumulVar(index).SetRange(
-                    start_window,
-                    end_window
+                    hard_start,
+                    hard_end
                 )
 
-        else:
+                # Miękka kara za wcześniejszy przyjazd
+                time_dimension.SetCumulVarSoftLowerBound(
+                    index,
+                    time_window[0],
+                    data['early_penalty']
+                )
 
-            # ══════════════════════════════════════════
-            # BRAK OKIENEK = CZYSTY TSP
-            # ══════════════════════════════════════════
-
-            routing.AddDimension(
-                time_callback_index,
-                0,
-                172800,
-                False,
-                'Time'
-            )
-
-            time_dimension = routing.GetDimensionOrDie('Time')
-
-            for vehicle_id in range(data['num_vehicles']):
-
-                start_index = routing.Start(vehicle_id)
-
-                time_dimension.CumulVar(start_index).SetRange(
-                    data['start_seconds'],
-                    data['start_seconds']
+                # Miękka kara za spóźnienie
+                time_dimension.SetCumulVarSoftUpperBound(
+                    index,
+                    time_window[1],
+                    data['late_penalty']
                 )
 
         # ══════════════════════════════════════════════
@@ -294,13 +290,7 @@ def solve_tsptw(request: RouteRequest):
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         )
 
-        if has_real_time_windows:
-
-            search_parameters.guided_local_search_lambda_coefficient = 0.5
-
-        else:
-
-            search_parameters.guided_local_search_lambda_coefficient = 0.1
+        search_parameters.guided_local_search_lambda_coefficient = 0.5
 
         # ══════════════════════════════════════════════
         # LIMIT CZASU
