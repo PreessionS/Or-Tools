@@ -15,25 +15,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class RouteRequest(BaseModel):
     num_vehicles: int = 1
     start_seconds: int = 0
+
     starts: list[int]
     ends: list[int]
+
     first_nodes: list[int] = []
     last_nodes: list[int] = []
+
     distance_matrix: list[list[int]]
     time_matrix: list[list[int]]
+
+    # [(start, end)]
     time_windows: list[tuple[int, int]]
-    # Kara za każdą sekundę czekania przed okienkiem.
-    # 150 oznacza, że 1 minuta czekania (60s) "kosztuje" solvera tyle samo co 9 km trasy (150*60 = 9000m).
-    # Zwiększ tę wartość, jeśli solver zbyt często decyduje się na czekanie.
+
+    # Kara za każdą sekundę czekania
     wait_penalty_coefficient: int = 150
 
 
 @app.post("/solve_tsptw")
 def solve_tsptw(request: RouteRequest):
+
     try:
+
         data = {
             'distance_matrix': request.distance_matrix,
             'time_matrix': request.time_matrix,
@@ -48,151 +55,237 @@ def solve_tsptw(request: RouteRequest):
         }
 
         # ══════════════════════════════════════════════
-        # WYKRYWANIE CZY SĄ AKTYWNE OGRANICZENIA
+        # WYKRYWANIE OGRANICZEŃ
         # ══════════════════════════════════════════════
+
         has_real_time_windows = any(
             tw[0] > 0 or tw[1] < 86400
             for i, tw in enumerate(data['time_windows'])
             if i not in data['starts'] and i not in data['ends']
         )
-        has_ordering = bool(data['first_nodes'] or data['last_nodes'])
+
+        has_ordering = bool(
+            data['first_nodes'] or data['last_nodes']
+        )
 
         # ══════════════════════════════════════════════
         # MANAGER I MODEL
         # ══════════════════════════════════════════════
+
         manager = pywrapcp.RoutingIndexManager(
             len(data['distance_matrix']),
             data['num_vehicles'],
             data['starts'],
             data['ends']
         )
+
         routing = pywrapcp.RoutingModel(manager)
 
         # ══════════════════════════════════════════════
         # CALLBACK ODLEGŁOŚCI
         # ══════════════════════════════════════════════
+
         def distance_callback(from_index, to_index):
+
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
+
             return data['distance_matrix'][from_node][to_node]
 
-        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        transit_callback_index = routing.RegisterTransitCallback(
+            distance_callback
+        )
+
+        routing.SetArcCostEvaluatorOfAllVehicles(
+            transit_callback_index
+        )
 
         # ══════════════════════════════════════════════
         # CALLBACK CZASU
         # ══════════════════════════════════════════════
+
         def time_callback(from_index, to_index):
+
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
+
             return data['time_matrix'][from_node][to_node]
 
-        time_callback_index = routing.RegisterTransitCallback(time_callback)
+        time_callback_index = routing.RegisterTransitCallback(
+            time_callback
+        )
 
         # ══════════════════════════════════════════════
-        # WYMIAR CZASU — ELASTYCZNE OGRANICZENIE CZEKANIA
+        # WYMIAR CZASU
+        # MAX 30 MIN WCZEŚNIEJ / PÓŹNIEJ
         # ══════════════════════════════════════════════
+
         if has_real_time_windows:
-            # slack_max = 86400 pozwala na czekanie (elastyczność - zawsze znajdzie trasę)
+
+            MAX_EARLY_LATE = 1800  # 30 minut
+
             routing.AddDimension(
                 time_callback_index,
-                86400,       # Max czas czekania (24h) - gwarantuje, że solver nie odrzuci trasy
-                172800,      # Max czas całkowity
-                False,
-                'Time'
-            )
-            time_dimension = routing.GetDimensionOrDie('Time')
-
-            # MIĘKKIE OGRANICZENIE: Kara za każdą sekundę czekania (slack).
-            # Solver będzie robił wszystko (nawet objazdy), by uniknąć czekania,
-            # ale jeśli to niemożliwe - poczeka, by uratować trasę.
-            time_dimension.SetSlackCostCoefficientForAllVehicles(
-                data['wait_penalty_coefficient']
-            )
-
-            for vehicle_id in range(data['num_vehicles']):
-                start_index = routing.Start(vehicle_id)
-                time_dimension.CumulVar(start_index).SetRange(
-                    data['start_seconds'],
-                    data['start_seconds']
-                )
-
-            # Okienka czasowe
-            for location_idx, time_window in enumerate(data['time_windows']):
-                if location_idx in data['starts'] or location_idx in data['ends']:
-                    continue
-                index = manager.NodeToIndex(location_idx)
-                time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
-
-        else:
-            # ---- BRAK OKIENEK: czysty TSP ----
-            # Zero czekania i brak kary za slack (nie psuje tras dla bliskich punktów)
-            routing.AddDimension(
-                time_callback_index,
-                0,           # slack_max = 0
+                MAX_EARLY_LATE,   # max slack/wait
                 172800,
                 False,
                 'Time'
             )
+
+            time_dimension = routing.GetDimensionOrDie('Time')
+
+            # Kara za czekanie
+            time_dimension.SetSlackCostCoefficientForAllVehicles(
+                data['wait_penalty_coefficient']
+            )
+
+            # Ustawienie czasu startu
+            for vehicle_id in range(data['num_vehicles']):
+
+                start_index = routing.Start(vehicle_id)
+
+                time_dimension.CumulVar(start_index).SetRange(
+                    data['start_seconds'],
+                    data['start_seconds']
+                )
+
+            # Okna czasowe z tolerancją ±30 minut
+            for location_idx, time_window in enumerate(
+                data['time_windows']
+            ):
+
+                if (
+                    location_idx in data['starts']
+                    or location_idx in data['ends']
+                ):
+                    continue
+
+                index = manager.NodeToIndex(location_idx)
+
+                start_window = max(
+                    0,
+                    time_window[0] - MAX_EARLY_LATE
+                )
+
+                end_window = (
+                    time_window[1] + MAX_EARLY_LATE
+                )
+
+                time_dimension.CumulVar(index).SetRange(
+                    start_window,
+                    end_window
+                )
+
+        else:
+
+            # ══════════════════════════════════════════
+            # BRAK OKIENEK = CZYSTY TSP
+            # ══════════════════════════════════════════
+
+            routing.AddDimension(
+                time_callback_index,
+                0,
+                172800,
+                False,
+                'Time'
+            )
+
             time_dimension = routing.GetDimensionOrDie('Time')
 
             for vehicle_id in range(data['num_vehicles']):
+
                 start_index = routing.Start(vehicle_id)
+
                 time_dimension.CumulVar(start_index).SetRange(
                     data['start_seconds'],
                     data['start_seconds']
                 )
 
         # ══════════════════════════════════════════════
-        # STEP COUNTER (tylko gdy first/last są podane)
+        # STEP COUNTER
         # ══════════════════════════════════════════════
+
         if has_ordering:
+
             routing.AddConstantDimension(
                 1,
                 len(data['distance_matrix']) + 1,
                 True,
                 'StepCounter'
             )
-            step_dimension = routing.GetDimensionOrDie('StepCounter')
+
+            step_dimension = routing.GetDimensionOrDie(
+                'StepCounter'
+            )
 
             num_first = len(data['first_nodes'])
             num_last = len(data['last_nodes'])
+
             middle_nodes = [
-                i for i in range(len(data['distance_matrix']))
-                if i not in data['starts']
-                and i not in data['ends']
-                and i not in data['first_nodes']
-                and i not in data['last_nodes']
+
+                i for i in range(
+                    len(data['distance_matrix'])
+                )
+
+                if (
+                    i not in data['starts']
+                    and i not in data['ends']
+                    and i not in data['first_nodes']
+                    and i not in data['last_nodes']
+                )
             ]
+
             num_mid = len(middle_nodes)
 
-            for node in range(len(data['distance_matrix'])):
-                if node in data['starts'] or node in data['ends']:
+            for node in range(
+                len(data['distance_matrix'])
+            ):
+
+                if (
+                    node in data['starts']
+                    or node in data['ends']
+                ):
                     continue
+
                 index = manager.NodeToIndex(node)
+
                 if node in data['first_nodes']:
-                    step_dimension.CumulVar(index).SetRange(1, num_first)
+
+                    step_dimension.CumulVar(index).SetRange(
+                        1,
+                        num_first
+                    )
+
                 elif node in data['last_nodes']:
+
                     step_dimension.CumulVar(index).SetRange(
                         num_first + num_mid + 1,
                         num_first + num_mid + num_last
                     )
+
                 else:
+
                     step_dimension.CumulVar(index).SetRange(
                         num_first + 1,
                         num_first + num_mid
                     )
 
         # ══════════════════════════════════════════════
-        # PARAMETRY SZUKANIA
+        # PARAMETRY SOLVERA
         # ══════════════════════════════════════════════
-        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+
+        search_parameters = (
+            pywrapcp.DefaultRoutingSearchParameters()
+        )
 
         if has_real_time_windows or has_ordering:
+
             search_parameters.first_solution_strategy = (
                 routing_enums_pb2.FirstSolutionStrategy.PATH_MOST_CONSTRAINED_ARC
             )
+
         else:
+
             search_parameters.first_solution_strategy = (
                 routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             )
@@ -202,22 +295,34 @@ def solve_tsptw(request: RouteRequest):
         )
 
         if has_real_time_windows:
+
             search_parameters.guided_local_search_lambda_coefficient = 0.5
+
         else:
+
             search_parameters.guided_local_search_lambda_coefficient = 0.1
 
-        # Czas zależny od wielkości problemu
+        # ══════════════════════════════════════════════
+        # LIMIT CZASU
+        # ══════════════════════════════════════════════
+
         n = len(data['distance_matrix'])
+
         if n <= 10:
             time_limit = 3
+
         elif n <= 20:
             time_limit = 10
+
         elif n <= 42:
             time_limit = 25
+
         elif n <= 80:
             time_limit = 40
+
         else:
             time_limit = 50
+
         search_parameters.time_limit.seconds = time_limit
 
         search_parameters.log_search = True
@@ -225,63 +330,106 @@ def solve_tsptw(request: RouteRequest):
         # ══════════════════════════════════════════════
         # ROZWIĄZYWANIE
         # ══════════════════════════════════════════════
-        solution = routing.SolveWithParameters(search_parameters)
+
+        solution = routing.SolveWithParameters(
+            search_parameters
+        )
 
         # ══════════════════════════════════════════════
         # WYNIK
         # ══════════════════════════════════════════════
+
         if solution:
+
             total_distance = 0
             all_routes = []
 
-            for vehicle_id in range(data['num_vehicles']):
+            for vehicle_id in range(
+                data['num_vehicles']
+            ):
+
                 index = routing.Start(vehicle_id)
+
                 route = []
 
                 while not routing.IsEnd(index):
-                    time_var = time_dimension.CumulVar(index)
+
+                    time_var = (
+                        time_dimension.CumulVar(index)
+                    )
+
                     node = manager.IndexToNode(index)
+
                     route.append({
                         "node": node,
                         "arrival_min": solution.Min(time_var),
                         "arrival_max": solution.Max(time_var)
                     })
-                    next_index = solution.Value(routing.NextVar(index))
-                    total_distance += routing.GetArcCostForVehicle(
-                        index, next_index, vehicle_id
+
+                    next_index = solution.Value(
+                        routing.NextVar(index)
                     )
+
+                    total_distance += (
+                        routing.GetArcCostForVehicle(
+                            index,
+                            next_index,
+                            vehicle_id
+                        )
+                    )
+
                     index = next_index
 
                 time_var = time_dimension.CumulVar(index)
+
                 route.append({
                     "node": manager.IndexToNode(index),
                     "arrival_min": solution.Min(time_var),
                     "arrival_max": solution.Max(time_var)
                 })
+
                 all_routes.append(route)
 
             result = {
+
                 "status": "success",
+
                 "total_distance": total_distance,
+
                 "computing_time_used": time_limit,
-                "strategy_used": "constrained" if (
-                    has_real_time_windows or has_ordering
-                ) else "cheapest_arc",
+
+                "strategy_used": (
+                    "constrained"
+                    if (
+                        has_real_time_windows
+                        or has_ordering
+                    )
+                    else "cheapest_arc"
+                )
             }
 
             if data['num_vehicles'] == 1:
+
                 result["route"] = all_routes[0]
+
             else:
+
                 result["routes"] = all_routes
 
             return result
+
         else:
+
             return {
                 "status": "failed",
-                "message": "Nie znaleziono trasy spełniającej ograniczenia."
+                "message": (
+                    "Nie znaleziono trasy "
+                    "spełniającej ograniczenia."
+                )
             }
 
     except Exception as e:
+
         return {
             "status": "error",
             "message": str(e),
