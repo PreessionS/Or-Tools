@@ -332,7 +332,7 @@ def solve_tsptw(request: RouteRequest):
             time_limit = 60
 
         elif n <= 300:
-            time_limit = 90
+            time_limit = 140
 
         else:
             time_limit = 180
