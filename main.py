@@ -39,57 +39,6 @@ class RouteRequest(BaseModel):
     late_penalty: int = 2000
 
 
-SOLVER_STATUS_MAP = {
-    0: "Solver nie został uruchomiony",
-    1: "Rozwiązanie znalezione",
-    2: "Brak feasible solution — dane mogą być sprzeczne",
-    3: "Przekroczono limit czasu — brak rozwiązania w wyznaczonym czasie",
-    4: "Nieprawidłowe dane wejściowe",
-}
-
-TRIVIAL_WINDOW = (0, 86400)
-
-
-def normalize_window(
-    tw: tuple[int, int],
-    start_seconds: int
-) -> tuple[int, int]:
-    """
-    Normalizuje okno czasowe względem czasu startu trasy.
-    Obsługuje przejście przez północ — jeśli okno wypada
-    przed startem, przesuwa je o +86400s (następna doba).
-    """
-
-    start_tw, end_tw = tw
-
-    # Całe okno przed startem — przeskok przez północ
-    if end_tw < start_seconds:
-        return (start_tw + 86400, end_tw + 86400)
-
-    # Okno zaczyna się przed startem, koniec też przed startem
-    # (end_tw < start_tw oznacza przejście przez północ)
-    if start_tw > end_tw:
-        return (start_tw, end_tw + 86400)
-
-    return (start_tw, end_tw)
-
-
-def is_trivial(
-    tw: tuple[int, int],
-    start_seconds: int
-) -> bool:
-    """
-    Okno jest trywialne jeśli po normalizacji obejmuje
-    pełną dobę lub więcej — czyli nie narzuca żadnego
-    realnego ograniczenia.
-    """
-
-    normalized = normalize_window(tw, start_seconds)
-    duration = normalized[1] - normalized[0]
-
-    return duration >= 86400
-
-
 @app.post("/solve_tsptw")
 def solve_tsptw(request: RouteRequest):
 
@@ -109,17 +58,14 @@ def solve_tsptw(request: RouteRequest):
             'late_penalty': request.late_penalty
         }
 
-        starts_set = set(data['starts'])
-        ends_set = set(data['ends'])
-
         # ══════════════════════════════════════════════
         # WYKRYWANIE OGRANICZEŃ
         # ══════════════════════════════════════════════
 
         has_real_time_windows = any(
-            not is_trivial(tw, data['start_seconds'])
+            tw[0] > 0 or tw[1] < 86400
             for i, tw in enumerate(data['time_windows'])
-            if i not in starts_set and i not in ends_set
+            if i not in data['starts'] and i not in data['ends']
         )
 
         has_ordering = bool(
@@ -175,11 +121,12 @@ def solve_tsptw(request: RouteRequest):
 
         # ══════════════════════════════════════════════
         # WYMIAR CZASU
+        # BRAK CZEKANIA + SOFT TIME WINDOWS
         # ══════════════════════════════════════════════
 
         routing.AddDimension(
             time_callback_index,
-            0,          # brak czekania — okna miękkie obsługują tolerancję
+            0,          # BRAK slack/czekania
             172800,
             False,
             'Time'
@@ -201,7 +148,7 @@ def solve_tsptw(request: RouteRequest):
             )
 
         # ══════════════════════════════════════════════
-        # OKNA CZASOWE Z NORMALIZACJĄ
+        # OKNA CZASOWE
         # ±30 MIN ODCHYLENIA
         # ══════════════════════════════════════════════
 
@@ -214,20 +161,10 @@ def solve_tsptw(request: RouteRequest):
             ):
 
                 if (
-                    location_idx in starts_set
-                    or location_idx in ends_set
+                    location_idx in data['starts']
+                    or location_idx in data['ends']
                 ):
                     continue
-
-                # Pomiń trywialne okna
-                if is_trivial(time_window, data['start_seconds']):
-                    continue
-
-                # Normalizacja względem startu trasy
-                time_window = normalize_window(
-                    time_window,
-                    data['start_seconds']
-                )
 
                 index = manager.NodeToIndex(location_idx)
 
@@ -287,8 +224,8 @@ def solve_tsptw(request: RouteRequest):
                 )
 
                 if (
-                    i not in starts_set
-                    and i not in ends_set
+                    i not in data['starts']
+                    and i not in data['ends']
                     and i not in data['first_nodes']
                     and i not in data['last_nodes']
                 )
@@ -301,8 +238,8 @@ def solve_tsptw(request: RouteRequest):
             ):
 
                 if (
-                    node in starts_set
-                    or node in ends_set
+                    node in data['starts']
+                    or node in data['ends']
                 ):
                     continue
 
@@ -373,14 +310,8 @@ def solve_tsptw(request: RouteRequest):
         elif n <= 80:
             time_limit = 40
 
-        elif n <= 150:
-            time_limit = 60
-
-        elif n <= 300:
-            time_limit = 90
-
         else:
-            time_limit = 180
+            time_limit = 50
 
         search_parameters.time_limit.seconds = time_limit
 
@@ -479,14 +410,11 @@ def solve_tsptw(request: RouteRequest):
 
         else:
 
-            solver_status = routing.status()
-
             return {
                 "status": "failed",
-                "solver_status": solver_status,
-                "message": SOLVER_STATUS_MAP.get(
-                    solver_status,
-                    "Nieznany błąd solvera"
+                "message": (
+                    "Ustawione okna czasowe "
+                    "nie są realne do zrealizowania."
                 )
             }
 
