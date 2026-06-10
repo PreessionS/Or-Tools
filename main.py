@@ -413,8 +413,8 @@ def solve_tsptw(request: RouteRequest):
             return {
                 "status": "failed",
                 "message": (
-                    "Nie znaleziono trasy "
-                    "spełniającej ograniczenia."
+                    "Ustawione okna czasowe "
+                    "nie są realne do zrealizowania."
                 )
             }
 
