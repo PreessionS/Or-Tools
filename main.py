@@ -50,6 +50,46 @@ SOLVER_STATUS_MAP = {
 TRIVIAL_WINDOW = (0, 86400)
 
 
+def normalize_window(
+    tw: tuple[int, int],
+    start_seconds: int
+) -> tuple[int, int]:
+    """
+    Normalizuje okno czasowe względem czasu startu trasy.
+    Obsługuje przejście przez północ — jeśli okno wypada
+    przed startem, przesuwa je o +86400s (następna doba).
+    """
+
+    start_tw, end_tw = tw
+
+    # Całe okno przed startem — przeskok przez północ
+    if end_tw < start_seconds:
+        return (start_tw + 86400, end_tw + 86400)
+
+    # Okno zaczyna się przed startem, koniec też przed startem
+    # (end_tw < start_tw oznacza przejście przez północ)
+    if start_tw > end_tw:
+        return (start_tw, end_tw + 86400)
+
+    return (start_tw, end_tw)
+
+
+def is_trivial(
+    tw: tuple[int, int],
+    start_seconds: int
+) -> bool:
+    """
+    Okno jest trywialne jeśli po normalizacji obejmuje
+    pełną dobę lub więcej — czyli nie narzuca żadnego
+    realnego ograniczenia.
+    """
+
+    normalized = normalize_window(tw, start_seconds)
+    duration = normalized[1] - normalized[0]
+
+    return duration >= 86400
+
+
 @app.post("/solve_tsptw")
 def solve_tsptw(request: RouteRequest):
 
@@ -77,8 +117,7 @@ def solve_tsptw(request: RouteRequest):
         # ══════════════════════════════════════════════
 
         has_real_time_windows = any(
-            tuple(tw) != TRIVIAL_WINDOW
-            and (tw[0] > 0 or tw[1] < 86400)
+            not is_trivial(tw, data['start_seconds'])
             for i, tw in enumerate(data['time_windows'])
             if i not in starts_set and i not in ends_set
         )
@@ -162,7 +201,7 @@ def solve_tsptw(request: RouteRequest):
             )
 
         # ══════════════════════════════════════════════
-        # OKNA CZASOWE
+        # OKNA CZASOWE Z NORMALIZACJĄ
         # ±30 MIN ODCHYLENIA
         # ══════════════════════════════════════════════
 
@@ -181,8 +220,14 @@ def solve_tsptw(request: RouteRequest):
                     continue
 
                 # Pomiń trywialne okna
-                if tuple(time_window) == TRIVIAL_WINDOW:
+                if is_trivial(time_window, data['start_seconds']):
                     continue
+
+                # Normalizacja względem startu trasy
+                time_window = normalize_window(
+                    time_window,
+                    data['start_seconds']
+                )
 
                 index = manager.NodeToIndex(location_idx)
 
