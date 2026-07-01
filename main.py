@@ -329,23 +329,23 @@ def solve_tsptw(request: RouteRequest):
         # ══════════════════════════════════════════════
 
         n = len(data['distance_matrix'])
-
-if n <= 10:
-    time_limit = 3
-elif n <= 20:
-    time_limit = 10
-elif n <= 42:
-    time_limit = 25
-elif n <= 80:
-    time_limit = 45
-elif n <= 150:
-    time_limit = 75
-elif n <= 200:
-    time_limit = 110
-elif n <= 300:
-    time_limit = 160
-else:
-    time_limit = MAX_SOLVER_TIME_SECONDS
+            
+            if n <= 10:
+                time_limit = 3
+            elif n <= 20:
+                time_limit = 10
+            elif n <= 42:
+                time_limit = 25
+            elif n <= 80:
+                time_limit = 45
+            elif n <= 150:
+                time_limit = 75
+            elif n <= 200:
+                time_limit = 110
+            elif n <= 300:
+                time_limit = 160
+            else:
+                time_limit = MAX_SOLVER_TIME_SECONDS
 
 
         search_parameters.time_limit.seconds = time_limit
