@@ -16,6 +16,21 @@ app.add_middleware(
 )
 
 
+# Wartości zgodne z aktualną aplikacją Android.
+# Brak okna czasowego jest wysyłany jako zakres 0..172800 sekund.
+DEFAULT_TIME_WINDOW_START = 0
+DEFAULT_TIME_WINDOW_END = 172800
+
+# Cloud Run ma obecnie timeout requestu 120 sekund.
+# Solver musi kończyć wcześniej, aby FastAPI zdążyło zwrócić poprawny JSON.
+MAX_SOLVER_TIME_SECONDS = 105
+
+# Minimalny horyzont czasu wewnątrz OR-Tools. Musi być większy niż domyślne
+# okno wysyłane przez aplikację, bo duże trasy bez okien czasowych mogą trwać
+# dłużej niż 48h po doliczeniu czasów postoju.
+MIN_ROUTE_TIME_HORIZON_SECONDS = DEFAULT_TIME_WINDOW_END * 4
+
+
 class RouteRequest(BaseModel):
     num_vehicles: int = 1
     start_seconds: int = 0
@@ -63,7 +78,8 @@ def solve_tsptw(request: RouteRequest):
         # ══════════════════════════════════════════════
 
         has_real_time_windows = any(
-            tw[0] > 0 or tw[1] < 86400
+            tw[0] > DEFAULT_TIME_WINDOW_START
+            or tw[1] < DEFAULT_TIME_WINDOW_END
             for i, tw in enumerate(data['time_windows'])
             if i not in data['starts'] and i not in data['ends']
         )
@@ -124,10 +140,26 @@ def solve_tsptw(request: RouteRequest):
         # BRAK CZEKANIA + SOFT TIME WINDOWS
         # ══════════════════════════════════════════════
 
+        max_transit_time = max(
+            (
+                max(row)
+                for row in data['time_matrix']
+                if row
+            ),
+            default=0
+        )
+
+        route_time_horizon = max(
+            MIN_ROUTE_TIME_HORIZON_SECONDS,
+            data['start_seconds'] + (
+                max_transit_time * len(data['time_matrix'])
+            )
+        )
+
         routing.AddDimension(
             time_callback_index,
             0,          # BRAK slack/czekania
-            172800,
+            route_time_horizon,
             False,
             'Time'
         )
@@ -310,8 +342,14 @@ def solve_tsptw(request: RouteRequest):
         elif n <= 80:
             time_limit = 40
 
+        elif n <= 200:
+            time_limit = 60
+
+        elif n <= 300:
+            time_limit = 90
+
         else:
-            time_limit = 50
+            time_limit = MAX_SOLVER_TIME_SECONDS
 
         search_parameters.time_limit.seconds = time_limit
 
@@ -410,12 +448,25 @@ def solve_tsptw(request: RouteRequest):
 
         else:
 
-            return {
-                "status": "failed",
-                "message": (
+            if has_real_time_windows:
+                message = (
                     "Ustawione okna czasowe "
                     "nie są realne do zrealizowania."
                 )
+            elif has_ordering:
+                message = (
+                    "Nie znaleziono trasy spełniającej "
+                    "ustawioną kolejność punktów."
+                )
+            else:
+                message = (
+                    "Nie udało się wyznaczyć trasy dla tak dużej "
+                    "liczby adresów w dostępnym czasie obliczeń."
+                )
+
+            return {
+                "status": "failed",
+                "message": message
             }
 
     except Exception as e:
