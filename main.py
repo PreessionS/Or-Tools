@@ -23,7 +23,7 @@ DEFAULT_TIME_WINDOW_END = 172800
 
 # Cloud Run ma obecnie timeout requestu 120 sekund.
 # Solver musi kończyć wcześniej, aby FastAPI zdążyło zwrócić poprawny JSON.
-MAX_SOLVER_TIME_SECONDS = 105
+MAX_SOLVER_TIME_SECONDS = 220
 
 # Minimalny horyzont czasu wewnątrz OR-Tools. Musi być większy niż domyślne
 # okno wysyłane przez aplikację, bo duże trasy bez okien czasowych mogą trwać
@@ -330,26 +330,23 @@ def solve_tsptw(request: RouteRequest):
 
         n = len(data['distance_matrix'])
 
-        if n <= 10:
-            time_limit = 3
+if n <= 10:
+    time_limit = 3
+elif n <= 20:
+    time_limit = 10
+elif n <= 42:
+    time_limit = 25
+elif n <= 80:
+    time_limit = 45
+elif n <= 150:
+    time_limit = 75
+elif n <= 200:
+    time_limit = 110
+elif n <= 300:
+    time_limit = 160
+else:
+    time_limit = MAX_SOLVER_TIME_SECONDS
 
-        elif n <= 20:
-            time_limit = 10
-
-        elif n <= 42:
-            time_limit = 25
-
-        elif n <= 80:
-            time_limit = 40
-
-        elif n <= 200:
-            time_limit = 60
-
-        elif n <= 300:
-            time_limit = 90
-
-        else:
-            time_limit = MAX_SOLVER_TIME_SECONDS
 
         search_parameters.time_limit.seconds = time_limit
 
